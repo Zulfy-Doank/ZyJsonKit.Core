@@ -1,0 +1,354 @@
+﻿# ══════════════════════════════════════════════════════════════
+#  ZyJsonKit.Core — CI/CD Pipeline
+#  Build · Test · Pack · Publish · Benchmark
+# ══════════════════════════════════════════════════════════════
+
+name: CI/CD — Build, Test & Publish
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags:     [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      run_benchmark:
+        description: 'Run performance benchmark'
+        required: false
+        default: false
+        type: boolean
+
+# ══════════════════════════════════════════════════════════════
+#  ENVIRONMENT VARIABLES
+# ══════════════════════════════════════════════════════════════
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT:       true
+  DOTNET_NOLOGO:                     true
+  NUGET_PACKAGES:                    ${{ github.workspace }}/.nuget/packages
+  SOLUTION:                          ZyJsonKit.Core.sln
+  PROJECT:                           src/ZyJsonKit.Core/ZyJsonKit.Core.vbproj
+  TEST_PROJECT:                      tests/ZyJsonKit.Core.Tests/ZyJsonKit.Core.Tests.vbproj
+  BENCHMARK_PROJECT:                 benchmarks/ZyJsonKit.Core.Benchmarks/ZyJsonKit.Core.Benchmarks.vbproj
+  ARTIFACTS_DIR:                     artifacts
+  TEST_RESULTS_DIR:                  TestResults
+  COVERAGE_DIR:                      CoverageResults
+
+# ══════════════════════════════════════════════════════════════
+#  JOB 1 — BUILD & TEST (Matrix: OS × .NET)
+# ══════════════════════════════════════════════════════════════
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────────
+  #  BUILD & TEST
+  # ──────────────────────────────────────────────────────────────
+
+  build-and-test:
+    name: 🔨 Build & Test | ${{ matrix.os }} | .NET ${{ matrix.dotnet }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:     [ ubuntu-latest, windows-latest ]
+        dotnet: [ '6.0.x', '8.0.x' ]
+
+    steps:
+
+      # ── Step 1: Checkout ──────────────────────────────────────
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for SourceLink & GitVersion
+
+      # ── Step 2: Setup .NET SDK ────────────────────────────────
+      - name: ⚙️ Setup .NET ${{ matrix.dotnet }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet }}
+          dotnet-quality: 'ga'
+
+      # ── Step 3: Cache NuGet Packages ──────────────────────────
+      - name: 📦 Cache NuGet Packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.vbproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # ── Step 4: Restore Dependencies ──────────────────────────
+      - name: 📥 Restore Dependencies
+        run: |
+          dotnet restore ${{ env.SOLUTION }} \
+            --locked-mode \
+            --verbosity normal
+
+      # ── Step 5: Build (Warnings as Errors) ────────────────────
+      - name: 🔨 Build Solution
+        run: |
+          dotnet build ${{ env.SOLUTION }} \
+            --configuration Release \
+            --no-restore \
+            -p:ContinuousIntegrationBuild=true \
+            -p:TreatWarningsAsErrors=true \
+            -p:GenerateDocumentationFile=true \
+            --verbosity minimal
+
+      # ── Step 6: Security Scan ─────────────────────────────────
+      - name: 🔒 Security Vulnerability Scan
+        run: |
+          echo "=== Scanning for vulnerable packages ==="
+          dotnet list ${{ env.SOLUTION }} package \
+            --vulnerable \
+            --include-transitive 2>&1 | tee security-scan.log
+          echo "=== Scan complete ==="
+
+      # ── Step 7: Run Tests with Coverage ───────────────────────
+      - name: 🧪 Run Tests with Coverage
+        run: |
+          dotnet test ${{ env.SOLUTION }} \
+            --configuration Release \
+            --no-build \
+            --logger "trx;LogFileName=test-results.trx" \
+            --logger "console;verbosity=detailed" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ${{ env.TEST_RESULTS_DIR }}/ \
+            --verbosity normal
+
+      # ── Step 8: Upload Test Results ───────────────────────────
+      - name: 📤 Upload Test Results (.trx)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}-net${{ matrix.dotnet }}
+          path: ${{ env.TEST_RESULTS_DIR }}/**/*.trx
+          retention-days: 14
+
+      # ── Step 9: Upload Coverage Report ────────────────────────
+      - name: 📤 Upload Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-net${{ matrix.dotnet }}
+          path: ${{ env.TEST_RESULTS_DIR }}/**/coverage.cobertura.xml
+          retention-days: 14
+
+      # ── Step 10: Upload to Codecov ────────────────────────────
+      - name: 📊 Upload to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.dotnet == '8.0.x'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ${{ env.TEST_RESULTS_DIR }}/**/coverage.cobertura.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          verbose: true
+          flags: unittests
+          name: zyjsonkit-coverage
+
+      # ── Step 11: Test Summary Report ──────────────────────────
+      - name: 📋 Generate Test Summary
+        if: always()
+        run: |
+          echo "## 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| OS | .NET | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ${{ matrix.os }} | ${{ matrix.dotnet }} | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────────────────────
+  #  PACK NUGE PACKAGE
+  # ──────────────────────────────────────────────────────────────
+
+  pack:
+    name: 📦 Pack NuGet Package
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    outputs:
+      package-version: ${{ steps.get-version.outputs.version }}
+      nupkg-filename: ${{ steps.pack.outputs.nupkg-filename }}
+
+    steps:
+
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ⚙️ Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: 📦 Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: ubuntu-nuget-${{ hashFiles('**/*.vbproj') }}
+          restore-keys: ubuntu-nuget-
+
+      - name: 📥 Restore
+        run: dotnet restore ${{ env.SOLUTION }} --locked-mode
+
+      - name: 🔨 Build Release
+        run: |
+          dotnet build ${{ env.SOLUTION }} \
+            --configuration Release \
+            --no-restore \
+            -p:ContinuousIntegrationBuild=true \
+            -p:TreatWarningsAsErrors=true
+
+      # ── Get Version from Tag ──────────────────────────────────
+      - name: 🏷️ Get Version from Tag
+        id: get-version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Package Version: $VERSION"
+
+      # ── Pack (.nupkg + .snupkg) ───────────────────────────────
+      - name: 📦 Create NuGet Package
+        id: pack
+        run: |
+          mkdir -p ${{ env.ARTIFACTS_DIR }}
+
+          dotnet pack ${{ env.PROJECT }} \
+            --configuration Release \
+            --no-build \
+            --include-symbols \
+            -p:SymbolPackageFormat=snupkg \
+            -p:PackageVersion=${{ steps.get-version.outputs.version }} \
+            -p:Version=${{ steps.get-version.outputs.version }} \
+            -p:ContinuousIntegrationBuild=true \
+            -p:RepositoryUrl=https://github.com/${{ github.repository }} \
+            -p:RepositoryType=git \
+            -p:RepositoryBranch=${{ github.ref_name }} \
+            -p:RepositoryCommit=${{ github.sha }} \
+            --output ${{ env.ARTIFACTS_DIR }}/
+
+          # Get nupkg filename
+          NUPKG_FILE=$(ls ${{ env.ARTIFACTS_DIR }}/*.nupkg | head -1)
+          echo "nupkg-filename=$(basename $NUPKG_FILE)" >> $GITHUB_OUTPUT
+          echo "📦 Created: $(basename $NUPKG_FILE)"
+
+      # ── Validate Package ──────────────────────────────────────
+      - name: ✅ Validate Package
+        run: |
+          dotnet nuget verify ${{ env.ARTIFACTS_DIR }}/*.nupkg
+          echo "✅ Package validation passed"
+
+      # ── Inspect Package ───────────────────────────────────────
+      - name: 🔍 Inspect Package Contents
+        run: |
+          echo "=== 📁 Package Files ==="
+          ls -lah ${{ env.ARTIFACTS_DIR }}/
+
+          echo ""
+          echo "=== 📦 .nupkg Contents ==="
+          unzip -l ${{ env.ARTIFACTS_DIR }}/*.nupkg | head -30
+
+          echo ""
+          echo "=== 🐛 .snupkg Contents ==="
+          unzip -l ${{ env.ARTIFACTS_DIR }}/*.snupkg | head -30
+
+      # ── Upload Artifacts ──────────────────────────────────────
+      - name: 📤 Upload .nupkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: ${{ env.ARTIFACTS_DIR }}/*.nupkg
+          retention-days: 30
+
+      - name: 📤 Upload .snupkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-symbols
+          path: ${{ env.ARTIFACTS_DIR }}/*.snupkg
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────
+  #  PUBLISH TO NUGET.ORG
+  # ──────────────────────────────────────────────────────────────
+
+  publish:
+    name: 🚀 Publish to NuGet.org
+    runs-on: ubuntu-latest
+    needs: pack
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: nuget-release
+
+    steps:
+
+      - name: 📥 Download .nupkg
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: ${{ env.ARTIFACTS_DIR }}/
+
+      - name: 📥 Download .snupkg
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-symbols
+          path: ${{ env.ARTIFACTS_DIR }}/
+
+      - name: ⚙️ Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # ── Dry Run Validation ────────────────────────────────────
+      - name: 🔍 Pre-Publish Validation
+        run: |
+          echo "=== 📦 Files to Publish ==="
+          ls -lah ${{ env.ARTIFACTS_DIR }}/
+
+          echo ""
+          echo "=== ✅ Final Validation ==="
+          dotnet nuget verify ${{ env.ARTIFACTS_DIR }}/*.nupkg
+
+      # ── Push .nupkg ───────────────────────────────────────────
+      - name: 📤 Push .nupkg to NuGet.org
+        run: |
+          dotnet nuget push \
+            ${{ env.ARTIFACTS_DIR }}/*.nupkg \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate \
+            --timeout 300
+          echo "✅ .nupkg published successfully"
+
+      # ── Push .snupkg ──────────────────────────────────────────
+      - name: 📤 Push .snupkg to NuGet.org
+        run: |
+          dotnet nuget push \
+            ${{ env.ARTIFACTS_DIR }}/*.snupkg \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate \
+            --timeout 300
+          echo "✅ .snupkg published successfully"
+
+      # ── Create GitHub Release ─────────────────────────────────
+      - name: 🎉 Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARTIFACTS_DIR }}/*.nupkg
+            ${{ env.ARTIFACTS_DIR }}/*.snupkg
+          tag_name: ${{ github.ref_name }}
+          name: ZyJsonKit.Core ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'preview') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          body: |
+            ## 🎉 ZyJsonKit.Core ${{ github.ref_name }}
+
+            ### 📦 Installation
+
+            **Package Manager:**
+            ```powershell
+            Install-Package ZyJsonKit.Core -Version ${{ needs.pack.outputs.package-version }}
